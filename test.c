@@ -378,7 +378,7 @@ int producer_thread(void *arg)
         int *item = malloc(sizeof(int));
         *item = i + 1;
         enqueue(item);
-        sleep(1)
+        sleep(1);
     }
 
     return 0;
