@@ -8,33 +8,38 @@ typedef struct Node {
     struct Node* next;
 } Node;
 
-static Node* volatile head = NULL;
-static Node* volatile tail = NULL;
-static mtx_t queue_lock;
-static cnd_t queue_not_empty;
-static atomic_size_t queue_size = 0;
-static atomic_size_t queue_waiting = 0;
-static atomic_size_t queue_visited = 0;
+typedef struct Queue {
+    Node* head;
+    Node* tail;
+    mtx_t lock;
+    cnd_t not_empty;
+    atomic_size_t size;
+    atomic_size_t waiting;
+    atomic_size_t visited;
+} Queue;
+
+static Queue queue;
 
 void initQueue(void) {
-    head = tail = NULL;
-    mtx_init(&queue_lock, mtx_plain);
-    cnd_init(&queue_not_empty);
-    queue_size = 0;
-    queue_waiting = 0;
-    queue_visited = 0;
+    queue.head = NULL;
+    queue.tail = NULL;
+    atomic_store(&queue.size, 0);
+    atomic_store(&queue.waiting, 0);
+    atomic_store(&queue.visited, 0);
+    mtx_init(&queue.lock, mtx_plain);
+    cnd_init(&queue.not_empty);
 }
 
 void destroyQueue(void) {
     Node* temp;
-    while (head != NULL) {
-        temp = head;
-        head = head->next;
+    while (queue.head != NULL) {
+        temp = queue.head;
+        queue.head = queue.head->next;
         free(temp);
     }
-    tail = NULL;
-    mtx_destroy(&queue_lock);
-    cnd_destroy(&queue_not_empty);
+    queue.tail = NULL;
+    mtx_destroy(&queue.lock);
+    cnd_destroy(&queue.not_empty);
 }
 
 void enqueue(void* item) {
@@ -42,67 +47,67 @@ void enqueue(void* item) {
     new_node->data = item;
     new_node->next = NULL;
 
-    mtx_lock(&queue_lock);
-    if (tail == NULL) {
-        head = tail = new_node;
+    mtx_lock(&queue.lock);
+    if (queue.tail != NULL) {
+        queue.tail->next = new_node;
     } else {
-        tail->next = new_node;
-        tail = new_node;
+        queue.head = new_node;
     }
-    atomic_fetch_add(&queue_size, 1);
-    cnd_signal(&queue_not_empty); // Changed from broadcast to signal
-    mtx_unlock(&queue_lock);
+    queue.tail = new_node;
+    atomic_fetch_add(&queue.size, 1);
+    cnd_signal(&queue.not_empty);
+    mtx_unlock(&queue.lock);
 }
 
 void* dequeue(void) {
-    mtx_lock(&queue_lock);
-    while (head == NULL) {
-        atomic_fetch_add(&queue_waiting, 1);
-        cnd_wait(&queue_not_empty, &queue_lock);
-        atomic_fetch_sub(&queue_waiting, 1);
+    mtx_lock(&queue.lock);
+    while (queue.head == NULL) {
+        atomic_fetch_add(&queue.waiting, 1);
+        cnd_wait(&queue.not_empty, &queue.lock);
+        atomic_fetch_sub(&queue.waiting, 1);
     }
-    Node* temp = head;
+    Node* temp = queue.head;
     void* data = temp->data;
-    head = head->next;
-    if (head == NULL) {
-        tail = NULL;
+    queue.head = queue.head->next;
+    if (queue.head == NULL) {
+        queue.tail = NULL;
     }
     free(temp);
-    atomic_fetch_sub(&queue_size, 1);
-    atomic_fetch_add(&queue_visited, 1);
-    mtx_unlock(&queue_lock);
+    atomic_fetch_sub(&queue.size, 1);
+    atomic_fetch_add(&queue.visited, 1);
+    mtx_unlock(&queue.lock);
     return data;
 }
 
 bool tryDequeue(void** item) {
-    if (mtx_trylock(&queue_lock) == thrd_success) {
-        if (head == NULL) {
-            mtx_unlock(&queue_lock);
+    if (mtx_trylock(&queue.lock) == thrd_success) {
+        if (queue.head == NULL) {
+            mtx_unlock(&queue.lock);
             return false;
         }
-        Node* temp = head;
+        Node* temp = queue.head;
         *item = temp->data;
-        head = head->next;
-        if (head == NULL) {
-        tail = NULL;
+        queue.head = queue.head->next;
+        if (queue.head == NULL) {
+            queue.tail = NULL;
         }
         free(temp);
-        atomic_fetch_sub(&queue_size, 1);
-        atomic_fetch_add(&queue_visited, 1);
-        mtx_unlock(&queue_lock);
+        atomic_fetch_sub(&queue.size, 1);
+        atomic_fetch_add(&queue.visited, 1);
+        mtx_unlock(&queue.lock);
         return true;
     }
     return false;
 }
 
 size_t size(void) {
-    return atomic_load(&queue_size);
+    return atomic_load(&queue.size);
 }
 
 size_t waiting(void) {
-    return atomic_load(&queue_waiting);
+    return atomic_load(&queue.waiting);
 }
 
 size_t visited(void) {
-    return atomic_load(&queue_visited);
+    return atomic_load(&queue.visited);
 }
