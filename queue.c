@@ -3,167 +3,256 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
-typedef struct ThreadElement {
-    thrd_t id;
-    struct ThreadElement *next;
-    cnd_t cnd_thread;
-    bool terminated;
-    int waiting_on;
-} ThreadElement;
+typedef struct ThreadNode {
+    thrd_t thread_id;
+    struct ThreadNode *next_node;
+    cnd_t condition_var;
+    bool is_terminated;
+    int wait_condition;
+} ThreadNode;
+
+typedef struct DataNode {
+    struct DataNode *next_node;
+    int data_index;
+    void *data_pointer;
+} DataNode;
 
 typedef struct ThreadQueue {
-    ThreadElement *head;
-    ThreadElement *tail;
-    atomic_ulong waiting_count;
+    ThreadNode *front;
+    ThreadNode *rear;
+    atomic_ulong count_waiting;
 } ThreadQueue;
 
-typedef struct DataElement {
-    struct DataElement *next;
-    int index;
-    void *data;
-} DataElement;
-
 typedef struct DataQueue {
-    DataElement *head;
-    DataElement *tail;
-    atomic_ulong queue_size;
-    atomic_ulong visited_count;
-    atomic_ulong enqueued_count;
+    DataNode *front;
+    DataNode *rear;
+    atomic_ulong size;
+    atomic_ulong count_visited;
+    atomic_ulong count_enqueued;
     mtx_t lock;
 } DataQueue;
 
-static ThreadQueue threadQueue = {0};
-static DataQueue dataQueue = {0};
-static thrd_t terminator;
+ThreadQueue threads_waiting;
+DataQueue data_in_queue;
+static thrd_t terminator_thread;
+
+void release_all_data_nodes(void);
+void dismantle_thread_queue(void);
+DataNode *generate_data_node(void *data);
+void insert_data_node(DataNode *node);
+void insert_into_empty_data_queue(DataNode *node);
+void insert_into_filled_data_queue(DataNode *node);
+bool should_thread_wait(void);
+void enqueue_thread(void);
+void dequeue_thread(void);
+void insert_thread_node(ThreadNode *node);
+void insert_into_empty_thread_queue(ThreadNode *node);
+void insert_into_filled_thread_queue(ThreadNode *node);
+ThreadNode *generate_thread_node(void);
+int fetch_first_thread_wait_condition(void);
 
 void initQueue(void) {
-    atomic_store(&dataQueue.queue_size, 0);
-    atomic_store(&threadQueue.waiting_count, 0);
-    atomic_store(&dataQueue.visited_count, 0);
-    atomic_store(&dataQueue.enqueued_count, 0);
-    dataQueue.head = NULL;
-    dataQueue.tail = NULL;
-    threadQueue.head = NULL;
-    threadQueue.tail = NULL;
-    mtx_init(&dataQueue.lock, mtx_plain);
+    data_in_queue.front = NULL;
+    threads_waiting.front = NULL;
+    data_in_queue.rear = NULL;
+    threads_waiting.rear = NULL;
+    atomic_store(&data_in_queue.size, 0);
+    atomic_store(&threads_waiting.count_waiting, 0);
+    atomic_store(&data_in_queue.count_visited, 0);
+    atomic_store(&data_in_queue.count_enqueued, 0);
+    mtx_init(&data_in_queue.lock, mtx_plain);
 }
 
 void destroyQueue(void) {
-    mtx_lock(&dataQueue.lock);
-    // Free all data elements
-    DataElement *currentElement = dataQueue.head;
-    while (currentElement != NULL) {
-        DataElement *nextElement = currentElement->next;
-        free(currentElement);
-        currentElement = nextElement;
-    }
-    // Reset data queue
-    dataQueue.head = NULL;
-    dataQueue.tail = NULL;
-    atomic_store(&dataQueue.queue_size, 0);
-    atomic_store(&dataQueue.visited_count, 0);
-    atomic_store(&dataQueue.enqueued_count, 0);
-    
-    // Signal and free all thread elements
-    terminator = thrd_current();
-    ThreadElement *currentThread = threadQueue.head;
-    while (currentThread != NULL) {
-        currentThread->terminated = true;
-        cnd_signal(&currentThread->cnd_thread);
-        ThreadElement *nextThread = currentThread->next;
-        free(currentThread);
-        currentThread = nextThread;
-    }
-    // Reset thread queue
-    threadQueue.head = NULL;
-    threadQueue.tail = NULL;
-    atomic_store(&threadQueue.waiting_count, 0);
-
-    mtx_unlock(&dataQueue.lock);
-    mtx_destroy(&dataQueue.lock);
+    mtx_lock(&data_in_queue.lock);
+    release_all_data_nodes();
+    dismantle_thread_queue();
+    mtx_unlock(&data_in_queue.lock);
+    mtx_destroy(&data_in_queue.lock);
 }
 
-static DataElement* createElement(void *data) {
-    DataElement *newElement = malloc(sizeof(DataElement));
-    if (newElement) {
-        newElement->data = data;
-        newElement->next = NULL;
-        newElement->index = atomic_fetch_add(&dataQueue.enqueued_count, 1);
+void release_all_data_nodes(void) {
+    DataNode *current_node;
+    while ((current_node = data_in_queue.front) != NULL) {
+        data_in_queue.front = current_node->next_node;
+        free(current_node);
     }
-    return newElement;
+    data_in_queue.rear = NULL;
+    atomic_store(&data_in_queue.size, 0);
+    atomic_store(&data_in_queue.count_visited, 0);
+    atomic_store(&data_in_queue.count_enqueued, 0);
+}
+
+void dismantle_thread_queue(void) {
+    terminator_thread = thrd_current();
+    while (threads_waiting.front != NULL) {
+        threads_waiting.front->is_terminated = true;
+        cnd_signal(&threads_waiting.front->condition_var);
+    }
+    threads_waiting.rear = NULL;
+    atomic_store(&threads_waiting.count_waiting, 0);
 }
 
 void enqueue(void *element_data) {
-    DataElement *newElement = createElement(element_data);
-    if (newElement == NULL) return; // Handle allocation failure
+    mtx_lock(&data_in_queue.lock);
+    DataNode *new_node = generate_data_node(element_data);
+    insert_data_node(new_node);
+    mtx_unlock(&data_in_queue.lock);
 
-    mtx_lock(&dataQueue.lock);
-    if (dataQueue.head == NULL) {
-        dataQueue.head = newElement;
-        dataQueue.tail = newElement;
+    if (atomic_load(&data_in_queue.size) > 0 && atomic_load(&threads_waiting.count_waiting) > 0) {
+        cnd_signal(&threads_waiting.front->condition_var);
+    }
+}
+
+DataNode *generate_data_node(void *data) {
+    DataNode *node = (DataNode *)malloc(sizeof(DataNode));
+    node->data_pointer = data;
+    node->next_node = NULL;
+    node->data_index = atomic_fetch_add(&data_in_queue.count_enqueued, 1);
+    return node;
+}
+
+void insert_data_node(DataNode *node) {
+    if (atomic_load(&data_in_queue.size) == 0) {
+        insert_into_empty_data_queue(node);
     } else {
-        dataQueue.tail->next = newElement;
-        dataQueue.tail = newElement;
-    }
-    atomic_fetch_add(&dataQueue.queue_size, 1);
-    mtx_unlock(&dataQueue.lock);
-
-    // Signal the condition variable of the first waiting thread if any
-    if (atomic_load(&threadQueue.waiting_count) > 0 && threadQueue.head != NULL) {
-        cnd_signal(&threadQueue.head->cnd_thread);
+        insert_into_filled_data_queue(node);
     }
 }
 
-void* dequeue(void) {
-    void *elementData = NULL;
-    mtx_lock(&dataQueue.lock);
-    while (dataQueue.head == NULL) { // Use while loop to handle spurious wake-ups
-        // Handle thread sleeping and signaling logic here
-        // For brevity, omitting detailed implementation
-    }
-
-    DataElement *element = dataQueue.head;
-    if (element != NULL) {
-        dataQueue.head = element->next;
-        if (dataQueue.head == NULL) {
-            dataQueue.tail = NULL;
-        }
-        atomic_fetch_sub(&dataQueue.queue_size, 1);
-        atomic_fetch_add(&dataQueue.visited_count, 1);
-        elementData = element->data;
-        free(element);
-    }
-    mtx_unlock(&dataQueue.lock);
-    return elementData;
+void insert_into_empty_data_queue(DataNode *node) {
+    data_in_queue.front = node;
+    data_in_queue.rear = node;
+    atomic_fetch_add(&data_in_queue.size, 1);
 }
 
-bool tryDequeue(void **elementData) {
-    bool dequeued = false;
-    mtx_lock(&dataQueue.lock);
-    if (dataQueue.head != NULL) {
-        DataElement *element = dataQueue.head;
-        dataQueue.head = element->next;
-        if (dataQueue.head == NULL) {
-            dataQueue.tail = NULL;
+void insert_into_filled_data_queue(DataNode *node) {
+    data_in_queue.rear->next_node = node;
+    data_in_queue.rear = node;
+    atomic_fetch_add(&data_in_queue.size, 1);
+}
+
+void *dequeue(void) {
+    mtx_lock(&data_in_queue.lock);
+    while (should_thread_wait()) {
+        enqueue_thread();
+        ThreadNode *current_thread_node = threads_waiting.rear;
+        cnd_wait(&current_thread_node->condition_var, &data_in_queue.lock);
+        if (current_thread_node->is_terminated) {
+            free(threads_waiting.front);
+            threads_waiting.front = threads_waiting.front->next_node;
+            thrd_join(terminator_thread, NULL);
         }
-        atomic_fetch_sub(&dataQueue.queue_size, 1);
-        atomic_fetch_add(&dataQueue.visited_count, 1);
-        *elementData = element->data;
-        free(element);
-        dequeued = true;
+        if (data_in_queue.front && fetch_first_thread_wait_condition() <= data_in_queue.front->data_index) {
+            dequeue_thread();
+        }
     }
-    mtx_unlock(&dataQueue.lock);
-    return dequeued;
+
+    DataNode *node_to_return = data_in_queue.front;
+    data_in_queue.front = node_to_return->next_node;
+    if (data_in_queue.front == NULL) {
+        data_in_queue.rear = NULL;
+    }
+    atomic_fetch_sub(&data_in_queue.size, 1);
+    atomic_fetch_add(&data_in_queue.count_visited, 1);
+    mtx_unlock(&data_in_queue.lock);
+    void *data = node_to_return->data_pointer;
+    free(node_to_return);
+    return data;
+}
+
+bool should_thread_wait(void) {
+    if (atomic_load(&data_in_queue.size) == 0) {
+        return true;
+    }
+    if (atomic_load(&threads_waiting.count_waiting) <= atomic_load(&data_in_queue.size)) {
+        return false;
+    }
+    int first_waiting_condition = fetch_first_thread_wait_condition();
+    return first_waiting_condition > data_in_queue.front->data_index;
+}
+
+int fetch_first_thread_wait_condition(void) {
+    for (ThreadNode *node = threads_waiting.front; node != NULL; node = node->next_node) {
+        if (thrd_equal(thrd_current(), node->thread_id)) {
+            return node->wait_condition;
+        }
+    }
+    return -1; // Not found
+}
+
+void enqueue_thread(void) {
+    ThreadNode *new_thread_node = generate_thread_node();
+    insert_thread_node(new_thread_node);
+}
+
+void dequeue_thread(void) {
+    ThreadNode *node_to_remove = threads_waiting.front;
+    threads_waiting.front = threads_waiting.front->next_node;
+    free(node_to_remove);
+    if (threads_waiting.front == NULL) {
+        threads_waiting.rear = NULL;
+    }
+    atomic_fetch_sub(&threads_waiting.count_waiting, 1);
+}
+
+void insert_thread_node(ThreadNode *node) {
+    if (atomic_load(&threads_waiting.count_waiting) == 0) {
+        insert_into_empty_thread_queue(node);
+    } else {
+        insert_into_filled_thread_queue(node);
+    }
+}
+
+void insert_into_empty_thread_queue(ThreadNode *node) {
+    threads_waiting.front = node;
+    threads_waiting.rear = node;
+    atomic_fetch_add(&threads_waiting.count_waiting, 1);
+}
+
+void insert_into_filled_thread_queue(ThreadNode *node) {
+    threads_waiting.rear->next_node = node;
+    threads_waiting.rear = node;
+    atomic_fetch_add(&threads_waiting.count_waiting, 1);
+}
+
+ThreadNode *generate_thread_node(void) {
+    ThreadNode *node = (ThreadNode *)malloc(sizeof(ThreadNode));
+    node->thread_id = thrd_current();
+    node->next_node = NULL;
+    node->is_terminated = false;
+    cnd_init(&node->condition_var);
+    node->wait_condition = atomic_load(&data_in_queue.count_enqueued) + atomic_load(&threads_waiting.count_waiting);
+    return node;
+}
+
+bool tryDequeue(void **element) {
+    mtx_lock(&data_in_queue.lock);
+    if (atomic_load(&data_in_queue.size) == 0 || data_in_queue.front == NULL) {
+        mtx_unlock(&data_in_queue.lock);
+        return false;
+    }
+    DataNode *node_to_return = data_in_queue.front;
+    data_in_queue.front = node_to_return->next_node;
+    if (data_in_queue.front == NULL) {
+        data_in_queue.rear = NULL;
+    }
+    atomic_fetch_sub(&data_in_queue.size, 1);
+    atomic_fetch_add(&data_in_queue.count_visited, 1);
+    mtx_unlock(&data_in_queue.lock);
+    *element = node_to_return->data_pointer;
+    free(node_to_return);
+    return true;
 }
 
 size_t size(void) {
-    return atomic_load(&dataQueue.queue_size);
+    return atomic_load(&data_in_queue.size);
 }
 
 size_t waiting(void) {
-    return atomic_load(&threadQueue.waiting_count);
+    return atomic_load(&threads_waiting.count_waiting);
 }
 
 size_t visited(void) {
-    return atomic_load(&dataQueue.visited_count);
+    return atomic_load(&data_in_queue.count_visited);
 }
