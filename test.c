@@ -8,7 +8,7 @@
 #define NUM_OPERATIONS 10
 #define MAX_SIZE 1000
 #define NUM_THREADS_CONC 100
-#define NUM_THREADS 49
+#define NUM_THREADS 50
 #define SECOND_IN_NANOSECONDS 1000000000
 
 int dequeue_with_sleep(void *arg);
@@ -345,7 +345,7 @@ void test_fifo_order()
     }
 
     // Verify FIFO order
-    for (int i = 0; i < NUM_THREADS-1; i++)
+    for (int i = 0; i < NUM_THREADS; i++)
     {
         printf("Thread %d dequeued item %d\n", i, dequeue_order[i]);
         assert(dequeue_order[i] == i + 1);
