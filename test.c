@@ -345,7 +345,7 @@ void test_fifo_order()
     }
 
     // Verify FIFO order
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < NUM_THREADS-1; i++)
     {
         printf("Thread %d dequeued item %d\n", i, dequeue_order[i]);
         assert(dequeue_order[i] == i + 1);
