@@ -16,7 +16,6 @@ static atomic_size_t queue_size = 0;
 static atomic_size_t queue_waiting = 0;
 static atomic_size_t queue_visited = 0;
 
-// Initialize the queue
 void initQueue(void) {
     head = tail = NULL;
     mtx_init(&queue_lock, mtx_plain);
@@ -26,7 +25,6 @@ void initQueue(void) {
     queue_visited = 0;
 }
 
-// Destroy the queue
 void destroyQueue(void) {
     Node* temp;
     while (head != NULL) {
@@ -39,7 +37,6 @@ void destroyQueue(void) {
     cnd_destroy(&queue_not_empty);
 }
 
-// Enqueue an item
 void enqueue(void* item) {
     Node* new_node = malloc(sizeof(Node));
     new_node->data = item;
@@ -53,11 +50,10 @@ void enqueue(void* item) {
         tail = new_node;
     }
     atomic_fetch_add(&queue_size, 1);
-    cnd_broadcast(&queue_not_empty); // Use broadcast to wake all waiting threads
+    cnd_signal(&queue_not_empty); // Changed from broadcast to signal
     mtx_unlock(&queue_lock);
 }
 
-// Dequeue an item
 void* dequeue(void) {
     mtx_lock(&queue_lock);
     while (head == NULL) {
@@ -68,7 +64,9 @@ void* dequeue(void) {
     Node* temp = head;
     void* data = temp->data;
     head = head->next;
-    if (head == NULL) tail = NULL;
+    if (head == NULL) {
+        tail = NULL;
+    }
     free(temp);
     atomic_fetch_sub(&queue_size, 1);
     atomic_fetch_add(&queue_visited, 1);
@@ -76,7 +74,6 @@ void* dequeue(void) {
     return data;
 }
 
-// Try to dequeue an item without blocking
 bool tryDequeue(void** item) {
     if (mtx_trylock(&queue_lock) == thrd_success) {
         if (head == NULL) {
@@ -86,7 +83,9 @@ bool tryDequeue(void** item) {
         Node* temp = head;
         *item = temp->data;
         head = head->next;
-        if (head == NULL) tail = NULL;
+        if (head == NULL) {
+        tail = NULL;
+        }
         free(temp);
         atomic_fetch_sub(&queue_size, 1);
         atomic_fetch_add(&queue_visited, 1);
@@ -96,17 +95,14 @@ bool tryDequeue(void** item) {
     return false;
 }
 
-// Get the current size of the queue
 size_t size(void) {
     return atomic_load(&queue_size);
 }
 
-// Get the number of waiting threads
 size_t waiting(void) {
     return atomic_load(&queue_waiting);
 }
 
-// Get the number of visited items
 size_t visited(void) {
     return atomic_load(&queue_visited);
 }
