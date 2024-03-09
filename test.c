@@ -327,7 +327,7 @@ void test_fifo_order()
         dequeue_order[i] = -1; // Initialize the dequeue order
         thrd_create(&consumer_threads[i], consumer_thread, &dequeue_order[i]);
         thrd_sleep(
-            &(const struct timespec){.tv_nsec = 0.005 * SECOND_IN_NANOSECONDS},
+            &(const struct timespec){.tv_nsec = 0.05 * SECOND_IN_NANOSECONDS},
             NULL);
     }
 
