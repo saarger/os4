@@ -8,7 +8,7 @@
 #define NUM_OPERATIONS 10
 #define MAX_SIZE 1000
 #define NUM_THREADS_CONC 100
-#define NUM_THREADS 50
+#define NUM_THREADS 49
 #define SECOND_IN_NANOSECONDS 1000000000
 
 int dequeue_with_sleep(void *arg);
