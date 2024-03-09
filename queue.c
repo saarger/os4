@@ -8,106 +8,110 @@ typedef struct Node {
     struct Node* next;
 } Node;
 
-typedef struct Queue {
-    Node* head;
-    Node* tail;
-    mtx_t lock;
-    cnd_t not_empty;
-    atomic_size_t size;
-    atomic_size_t waiting;
-    atomic_size_t visited;
-} Queue;
+static Node* volatile head = NULL;
+static Node* volatile tail = NULL;
+static mtx_t queue_lock;
+static cnd_t queue_not_empty;
+static atomic_size_t queue_size = 0;
+static atomic_size_t queue_waiting = 0;
+static atomic_size_t queue_visited = 0;
 
-static Queue queue;
-
+// Initialize the queue
 void initQueue(void) {
-    queue.head = NULL;
-    queue.tail = NULL;
-    atomic_store(&queue.size, 0);
-    atomic_store(&queue.waiting, 0);
-    atomic_store(&queue.visited, 0);
-    mtx_init(&queue.lock, mtx_plain);
-    cnd_init(&queue.not_empty);
+    head = tail = NULL;
+    mtx_init(&queue_lock, mtx_plain);
+    cnd_init(&queue_not_empty);
+    atomic_store(&queue_size, 0);
+    atomic_store(&queue_waiting, 0);
+    atomic_store(&queue_visited, 0);
 }
 
+// Destroy the queue
 void destroyQueue(void) {
     Node* temp;
-    while (queue.head != NULL) {
-        temp = queue.head;
-        queue.head = queue.head->next;
+    while (head != NULL) {
+        temp = head;
+        head = head->next;
         free(temp);
     }
-    queue.tail = NULL;
-    mtx_destroy(&queue.lock);
-    cnd_destroy(&queue.not_empty);
+    tail = NULL;
+    mtx_destroy(&queue_lock);
+    cnd_destroy(&queue_not_empty);
+    atomic_store(&queue_size, 0);
+    atomic_store(&queue_waiting, 0);
+    atomic_store(&queue_visited, 0);
 }
 
+// Enqueue an item
 void enqueue(void* item) {
     Node* new_node = malloc(sizeof(Node));
+    if (!new_node) return; // Handle malloc failure
+
     new_node->data = item;
     new_node->next = NULL;
 
-    mtx_lock(&queue.lock);
-    if (queue.tail != NULL) {
-        queue.tail->next = new_node;
+    mtx_lock(&queue_lock);
+    if (tail == NULL) {
+        head = tail = new_node;
     } else {
-        queue.head = new_node;
+        tail->next = new_node;
+        tail = new_node;
     }
-    queue.tail = new_node;
-    atomic_fetch_add(&queue.size, 1);
-    cnd_signal(&queue.not_empty);
-    mtx_unlock(&queue.lock);
+    atomic_fetch_add_explicit(&queue_size, 1, memory_order_release);
+    cnd_broadcast(&queue_not_empty);
+    mtx_unlock(&queue_lock);
 }
 
+// Dequeue an item
 void* dequeue(void) {
-    mtx_lock(&queue.lock);
-    while (queue.head == NULL) {
-        atomic_fetch_add(&queue.waiting, 1);
-        cnd_wait(&queue.not_empty, &queue.lock);
-        atomic_fetch_sub(&queue.waiting, 1);
+    mtx_lock(&queue_lock);
+    while (head == NULL) {
+        atomic_fetch_add_explicit(&queue_waiting, 1, memory_order_relaxed);
+        cnd_wait(&queue_not_empty, &queue_lock);
+        atomic_fetch_sub_explicit(&queue_waiting, 1, memory_order_relaxed);
     }
-    Node* temp = queue.head;
+    Node* temp = head;
     void* data = temp->data;
-    queue.head = queue.head->next;
-    if (queue.head == NULL) {
-        queue.tail = NULL;
-    }
+    head = head->next;
+    if (head == NULL) tail = NULL;
     free(temp);
-    atomic_fetch_sub(&queue.size, 1);
-    atomic_fetch_add(&queue.visited, 1);
-    mtx_unlock(&queue.lock);
+    atomic_fetch_sub_explicit(&queue_size, 1, memory_order_release);
+    atomic_fetch_add_explicit(&queue_visited, 1, memory_order_relaxed);
+    mtx_unlock(&queue_lock);
     return data;
 }
 
+// Try to dequeue an item without blocking
 bool tryDequeue(void** item) {
-    if (mtx_trylock(&queue.lock) == thrd_success) {
-        if (queue.head == NULL) {
-            mtx_unlock(&queue.lock);
+    if (mtx_trylock(&queue_lock) == thrd_success) {
+        if (head == NULL) {
+            mtx_unlock(&queue_lock);
             return false;
         }
-        Node* temp = queue.head;
+        Node* temp = head;
         *item = temp->data;
-        queue.head = queue.head->next;
-        if (queue.head == NULL) {
-            queue.tail = NULL;
-        }
+        head = head->next;
+        if (head == NULL) tail = NULL;
         free(temp);
-        atomic_fetch_sub(&queue.size, 1);
-        atomic_fetch_add(&queue.visited, 1);
-        mtx_unlock(&queue.lock);
+        atomic_fetch_sub_explicit(&queue_size, 1, memory_order_release);
+        atomic_fetch_add_explicit(&queue_visited, 1, memory_order_relaxed);
+        mtx_unlock(&queue_lock);
         return true;
     }
     return false;
 }
 
+// Get the current size of the queue
 size_t size(void) {
-    return atomic_load(&queue.size);
+    return atomic_load_explicit(&queue_size, memory_order_acquire);
 }
 
+// Get the number of waiting threads
 size_t waiting(void) {
-    return atomic_load(&queue.waiting);
+    return atomic_load_explicit(&queue_waiting, memory_order_acquire);
 }
 
+// Get the number of visited items
 size_t visited(void) {
-    return atomic_load(&queue.visited);
+    return atomic_load_explicit(&queue_visited, memory_order_acquire);
 }
