@@ -3,177 +3,294 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
-// Thread queue structure to manage threads in FIFO order.
-struct ThreadQueue {
-    struct ThreadElement *head;
-    struct ThreadElement *tail;
-    atomic_ulong waiting_count;
-};
+typedef struct ThreadElement
+{
+    thrd_t thread_id;
+    struct ThreadElement *next_element;
+    cnd_t condition_variable;
+    bool is_terminated;
+    int wait_count;
+} ThreadElement;
 
-// Represents an individual thread in the queue.
-struct ThreadElement {
-    thrd_t id; // Thread identifier
-    struct ThreadElement *next; // Pointer to the next thread in the queue
-    cnd_t cnd_thread; // Condition variable for the thread
-    bool terminated; // Flag indicating if the thread has been terminated
-    int waiting_on; // Condition or reason the thread is waiting on
-};
+typedef struct ThreadQueue
+{
+    ThreadElement *head;
+    ThreadElement *tail;
+    atomic_ulong num_waiting_threads;
+} ThreadQueue;
 
-// Data queue structure for managing data elements in FIFO order.
-struct DataQueue {
-    struct DataElement *head; // Head of the queue
-    struct DataElement *tail; // Tail of the queue
-    atomic_ulong queue_size; // Number of elements in the queue
-    atomic_ulong visited_count; // Count of elements that have been visited
-    atomic_ulong enqueued_count; // Total count of elements enqueued over time
-    mtx_t data_queue_lock; // Mutex for protecting access to the data queue
-};
+typedef struct DataElement
+{
+    struct DataElement *next_element;
+    int data_index;
+    void *data_payload;
+} DataElement;
 
-// Represents an individual data element in the queue.
-struct DataElement {
-    struct DataElement *next; // Next element in the queue
-    int index; // Index or identifier for the data element
-    void *data; // Pointer to the actual data
-};
+typedef struct DataQueue
+{
+    DataElement *head;
+    DataElement *tail;
+    atomic_ulong size_of_queue;
+    atomic_ulong num_visited_elements;
+    atomic_ulong num_enqueued_elements;
+    mtx_t lock;
+} DataQueue;
 
-static struct ThreadQueue thread_queue; // Global thread queue
-static struct DataQueue data_queue; // Global data queue
-static thrd_t terminator; // Thread used for termination signaling
+static ThreadQueue threads_queue;
+static DataQueue data_queue;
+static thrd_t cleanup_thread;
 
+void release_all_data_elements(void);
+void dismantle_thread_queue(void);
+DataElement *new_data_element(void *payload);
+void queue_data_element(DataElement *element);
+void queue_to_empty_data_queue(DataElement *element);
+void queue_to_non_empty_data_queue(DataElement *element);
+bool should_thread_wait(void);
+void place_thread_in_queue(void);
+void remove_thread_from_queue(void);
+void queue_thread_element(ThreadElement *element);
+void add_to_empty_thread_queue(ThreadElement *element);
+void add_to_nonempty_thread_queue(ThreadElement *element);
+ThreadElement *generate_thread_element(void);
+int fetch_first_thread_wait_count(void);
 
-void free_all_data_elements(void);
-void destroy_thread_queue(void);
-struct DataElement *create_element(void *data);
-void add_element_to_data_queue(struct DataElement *new_element);
-void add_element_to_empty_data_queue(struct DataElement *new_element);
-void add_element_to_nonempty_data_queue(struct DataElement *new_element);
-bool current_thread_should_sleep(void);
-void thread_enqueue(void);
-void thread_dequeue(void);
-void add_element_to_thread_queue(struct ThreadElement *new_element);
-void add_element_to_empty_thread_queue(struct ThreadElement *new_element);
-void add_element_to_nonempty_thread_queue(struct ThreadElement *new_element);
-struct ThreadElement *create_thread_element(void);
-int get_current_first_waiting_on(void);
-
-// Initializes both the data queue and thread queue.
-void initQueue(void) {
+void initQueue(void)
+{
     data_queue.head = NULL;
-    thread_queue.head = NULL;
     data_queue.tail = NULL;
-    thread_queue.tail = NULL;
-    atomic_store(&data_queue.queue_size, 0);
-    atomic_store(&thread_queue.waiting_count, 0);
-    atomic_store(&data_queue.visited_count, 0);
-    atomic_store(&data_queue.enqueued_count, 0);
-    mtx_init(&data_queue.data_queue_lock, mtx_plain);
+    threads_queue.head = NULL;
+    threads_queue.tail = NULL;
+    atomic_store(&data_queue.size_of_queue, 0);
+    atomic_store(&threads_queue.num_waiting_threads, 0);
+    atomic_store(&data_queue.num_visited_elements, 0);
+    atomic_store(&data_queue.num_enqueued_elements, 0);
+    mtx_init(&data_queue.lock, mtx_plain);
 }
 
-// Cleans up and destroys both queues.
-void destroyQueue(void) {
-    mtx_lock(&data_queue.data_queue_lock);
-    free_all_data_elements();
-    destroy_thread_queue();
-    mtx_unlock(&data_queue.data_queue_lock);
-    mtx_destroy(&data_queue.data_queue_lock);
+void destroyQueue(void)
+{
+    mtx_lock(&data_queue.lock);
+    release_all_data_elements();
+    dismantle_thread_queue();
+    mtx_unlock(&data_queue.lock);
+    mtx_destroy(&data_queue.lock);
 }
 
-// Frees all data elements in the data queue.
-void free_all_data_elements(void) {
-    struct DataElement *current;
-    while ((current = data_queue.head) != NULL) {
-        data_queue.head = current->next;
-        free(current->data); // Assuming 'data' needs to be freed.
-        free(current);
+void release_all_data_elements(void)
+{
+    DataElement *current_head;
+    while (data_queue.head)
+    {
+        current_head = data_queue.head;
+        data_queue.head = current_head->next_element;
+        free(current_head);
     }
     data_queue.tail = NULL;
-    atomic_store(&data_queue.queue_size, 0);
-    atomic_store(&data_queue.visited_count, 0);
-    atomic_store(&data_queue.enqueued_count, 0);
+    atomic_store(&data_queue.num_visited_elements, 0);
+    atomic_store(&data_queue.size_of_queue, 0);
+    atomic_store(&data_queue.num_enqueued_elements, 0);
 }
 
-// Signals all threads in the thread queue for termination and clears the queue.
-void destroy_thread_queue(void) {
-    terminator = thrd_current();
-    while (thread_queue.head != NULL) {
-        struct ThreadElement *current = thread_queue.head;
-        current->terminated = true;
-        cnd_signal(&current->cnd_thread);
-        // Removing the element from the queue
-        thread_queue.head = current->next;
-        free(current);
+void dismantle_thread_queue(void)
+{
+    cleanup_thread = thrd_current();
+    while (threads_queue.head)
+    {
+        threads_queue.head->is_terminated = true;
+        cnd_signal(&threads_queue.head->condition_variable);
     }
-    thread_queue.tail = NULL;
-    atomic_store(&thread_queue.waiting_count, 0);
+    threads_queue.tail = NULL;
+    atomic_store(&threads_queue.num_waiting_threads, 0);
 }
 
-// Enqueues a new data element.
-void enqueue(void *element_data) {
-    struct DataElement *new_element = create_element(element_data);
-    mtx_lock(&data_queue.data_queue_lock);
-    if (data_queue.tail) {
-        data_queue.tail->next = new_element;
-    } else {
-        data_queue.head = new_element;
-    }
-    data_queue.tail = new_element;
-    atomic_fetch_add(&data_queue.queue_size, 1);
-    atomic_fetch_add(&data_queue.enqueued_count, 1);
-    mtx_unlock(&data_queue.data_queue_lock);
+void enqueue(void *data_payload)
+{
+    mtx_lock(&data_queue.lock);
+    DataElement *element = new_data_element(data_payload);
+    queue_data_element(element);
+    mtx_unlock(&data_queue.lock);
 
-    // Signal the first waiting thread if any.
-    if (atomic_load(&thread_queue.waiting_count) > 0) {
-        mtx_lock(&data_queue.data_queue_lock);
-        if (thread_queue.head) {
-            cnd_signal(&thread_queue.head->cnd_thread);
-        }
-        mtx_unlock(&data_queue.data_queue_lock);
+    if (atomic_load(&data_queue.size_of_queue) > 0 && atomic_load(&threads_queue.num_waiting_threads) > 0)
+    {
+        cnd_signal(&threads_queue.head->condition_variable);
     }
 }
 
-// Create and return a new data element with provided data.
-struct DataElement *create_element(void *data) {
-    struct DataElement *element = (struct DataElement *)malloc(sizeof(struct DataElement));
-    element->data = data;
-    element->next = NULL;
-    element->index = atomic_load(&data_queue.enqueued_count);
+DataElement *new_data_element(void *payload)
+{
+    DataElement *element = (DataElement *)malloc(sizeof(DataElement));
+    element->data_payload = payload;
+    element->next_element = NULL;
+    element->data_index = atomic_fetch_add(&data_queue.num_enqueued_elements, 1);
     return element;
 }
 
-// Attempt to dequeue an element without blocking.
-bool tryDequeue(void **element) {
-    mtx_lock(&data_queue.data_queue_lock);
-    if (!data_queue.head) {
-        mtx_unlock(&data_queue.data_queue_lock);
-        return false;
+void queue_data_element(DataElement *element)
+{
+    atomic_load(&data_queue.size_of_queue) == 0 ? queue_to_empty_data_queue(element) : queue_to_non_empty_data_queue(element);
+}
+
+void queue_to_empty_data_queue(DataElement *element)
+{
+    data_queue.head = element;
+    data_queue.tail = element;
+    atomic_fetch_add(&data_queue.size_of_queue, 1);
+    atomic_fetch_add(&data_queue.num_enqueued_elements, 1);
+}
+
+void queue_to_non_empty_data_queue(DataElement *element)
+{
+    data_queue.tail->next_element = element;
+    data_queue.tail = element;
+    atomic_fetch_add(&data_queue.size_of_queue, 1);
+    atomic_fetch_add(&data_queue.num_enqueued_elements, 1);
+}
+
+void* dequeue(void)
+{
+    mtx_lock(&data_queue.lock);
+    while (should_thread_wait())
+    {
+        place_thread_in_queue();
+        ThreadElement *current_thread = threads_queue.tail;
+        cnd_wait(&current_thread->condition_variable, &data_queue.lock);
+        if (current_thread->is_terminated)
+        {
+            ThreadElement *former_head = threads_queue.head;
+            threads_queue.head = former_head->next_element;
+            free(former_head);
+            thrd_join(cleanup_thread, NULL);
+        }
+        if (data_queue.head && fetch_first_thread_wait_count() <= data_queue.head->data_index)
+        {
+            remove_thread_from_queue();
+        }
     }
 
-    struct DataElement *dequeued_element = data_queue.head;
-    *element = dequeued_element->data;
-    data_queue.head = dequeued_element->next;
-    if (!data_queue.head) {
+    DataElement *element_to_dequeue = data_queue.head;
+    data_queue.head = element_to_dequeue->next_element;
+    if (!data_queue.head)
+    {
         data_queue.tail = NULL;
     }
-    atomic_fetch_sub(&data_queue.queue_size, 1);
-    atomic_fetch_add(&data_queue.visited_count, 1);
-    free(dequeued_element);
-    mtx_unlock(&data_queue.data_queue_lock);
+    atomic_fetch_sub(&data_queue.size_of_queue, 1);
+    atomic_fetch_add(&data_queue.num_visited_elements, 1);
+    mtx_unlock(&data_queue.lock);
+    void *data = element_to_dequeue->data_payload;
+    free(element_to_dequeue);
+    return data;
+}
+
+bool should_thread_wait(void)
+{
+    if (atomic_load(&data_queue.size_of_queue) == 0)
+    {
+        return true;
+    }
+    if (atomic_load(&threads_queue.num_waiting_threads) <= atomic_load(&data_queue.size_of_queue))
+    {
+        return false;
+    }
+    int wait_count = fetch_first_thread_wait_count();
+    return wait_count > data_queue.head->data_index;
+}
+
+int fetch_first_thread_wait_count(void)
+{
+    ThreadElement *element = threads_queue.head;
+    while (element)
+    {
+        if (thrd_equal(thrd_current(), element->thread_id))
+        {
+            return element->wait_count;
+        }
+        element = element->next_element;
+    }
+    return -1;
+}
+
+void place_thread_in_queue(void)
+{
+    ThreadElement *element = generate_thread_element();
+    queue_thread_element(element);
+}
+
+void remove_thread_from_queue(void)
+{
+    ThreadElement *element_to_remove = threads_queue.head;
+    threads_queue.head = threads_queue.head->next_element;
+    free(element_to_remove);
+    if (!threads_queue.head)
+    {
+        threads_queue.tail = NULL;
+    }
+    atomic_fetch_sub(&threads_queue.num_waiting_threads, 1);
+}
+
+void queue_thread_element(ThreadElement *element)
+{
+    atomic_load(&threads_queue.num_waiting_threads) == 0 ? add_to_empty_thread_queue(element) : add_to_nonempty_thread_queue(element);
+}
+
+void add_to_empty_thread_queue(ThreadElement *element)
+{
+    threads_queue.head = element;
+    threads_queue.tail = element;
+    atomic_fetch_add(&threads_queue.num_waiting_threads, 1);
+}
+
+void add_to_nonempty_thread_queue(ThreadElement *element)
+{
+    threads_queue.tail->next_element = element;
+    threads_queue.tail = element;
+    atomic_fetch_add(&threads_queue.num_waiting_threads, 1);
+}
+
+ThreadElement *generate_thread_element(void)
+{
+    ThreadElement *element = (ThreadElement *)malloc(sizeof(ThreadElement));
+    element->thread_id = thrd_current();
+    element->next_element = NULL;
+    element->is_terminated = false;
+    cnd_init(&element->condition_variable);
+    element->wait_count = atomic_load(&data_queue.num_enqueued_elements) + atomic_load(&threads_queue.num_waiting_threads);
+    return element;
+}
+
+bool tryDequeue(void **payload)
+{
+    mtx_lock(&data_queue.lock);
+    while (atomic_load(&data_queue.size_of_queue) == 0 || !data_queue.head)
+    {
+        mtx_unlock(&data_queue.lock);
+        return false;
+    }
+    DataElement *element_to_dequeue = data_queue.head;
+    data_queue.head = element_to_dequeue->next_element;
+    if (!data_queue.head)
+    {
+        data_queue.tail = NULL;
+    }
+    atomic_fetch_sub(&data_queue.size_of_queue, 1);
+    atomic_fetch_add(&data_queue.num_visited_elements, 1);
+    mtx_unlock(&data_queue.lock);
+    *payload = element_to_dequeue->data_payload;
+    free(element_to_dequeue);
     return true;
 }
 
-// Returns the current number of elements in the queue.
-size_t size(void) {
-    return atomic_load(&data_queue.queue_size);
+size_t size(void)
+{
+    return atomic_load(&data_queue.size_of_queue);
 }
 
-// Returns the current number of threads waiting.
-size_t waiting(void) {
-    return atomic_load(&thread_queue.waiting_count);
+size_t waiting(void)
+{
+    return atomic_load(&threads_queue.num_waiting_threads);
 }
 
-// Returns the number of elements that have been visited.
-size_t visited(void) {
-    return atomic_load(&data_queue.visited_count);
+size_t visited(void)
+{
+    return atomic_load(&data_queue.num_visited_elements);
 }
-
-// Note: Implementations for `dequeue`, `thread_enqueue`, `add_element_to_thread_queue`, and related threading logic were implied but not fully detailed. They should manage thread waiting, waking, and safe removal from the thread queue based on the condition variables and atomic operations.
