@@ -40,6 +40,22 @@ static struct ThreadQueue thread_queue; // Global thread queue
 static struct DataQueue data_queue; // Global data queue
 static thrd_t terminator; // Thread used for termination signaling
 
+
+void free_all_data_elements(void);
+void destroy_thread_queue(void);
+struct DataElement *create_element(void *data);
+void add_element_to_data_queue(struct DataElement *new_element);
+void add_element_to_empty_data_queue(struct DataElement *new_element);
+void add_element_to_nonempty_data_queue(struct DataElement *new_element);
+bool current_thread_should_sleep(void);
+void thread_enqueue(void);
+void thread_dequeue(void);
+void add_element_to_thread_queue(struct ThreadElement *new_element);
+void add_element_to_empty_thread_queue(struct ThreadElement *new_element);
+void add_element_to_nonempty_thread_queue(struct ThreadElement *new_element);
+struct ThreadElement *create_thread_element(void);
+int get_current_first_waiting_on(void);
+
 // Initializes both the data queue and thread queue.
 void initQueue(void) {
     data_queue.head = NULL;
